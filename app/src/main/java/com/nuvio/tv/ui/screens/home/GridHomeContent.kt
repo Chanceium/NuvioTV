@@ -1,11 +1,9 @@
 package com.nuvio.tv.ui.screens.home
 
-import android.view.KeyEvent as AndroidKeyEvent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -33,7 +31,6 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import com.nuvio.tv.R
@@ -57,10 +54,7 @@ import com.nuvio.tv.ui.components.PosterCardDefaults
 import com.nuvio.tv.ui.components.PosterCardStyle
 import com.nuvio.tv.ui.theme.NuvioColors
 
-/** Minimum interval between processed key repeat events to prevent HWUI overload. */
-private const val KEY_REPEAT_THROTTLE_MS = 80L
-
-@OptIn(ExperimentalTvMaterial3Api::class, ExperimentalFoundationApi::class)
+@OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
 fun GridHomeContent(
     uiState: HomeUiState,
@@ -154,26 +148,11 @@ fun GridHomeContent(
         }
     }
 
-    // Throttle D-pad key repeats to prevent HWUI overload when a key is held down.
-    val lastKeyRepeatTime = remember { longArrayOf(0L) }
-
     Box(modifier = Modifier.fillMaxSize()) {
         LazyVerticalGrid(
             state = gridState,
             columns = GridCells.Adaptive(minSize = posterCardStyle.width),
-            modifier = Modifier
-                .fillMaxSize()
-                .onPreviewKeyEvent { event ->
-                    val native = event.nativeKeyEvent
-                    if (native.action == AndroidKeyEvent.ACTION_DOWN && native.repeatCount > 0) {
-                        val now = System.currentTimeMillis()
-                        if (now - lastKeyRepeatTime[0] < KEY_REPEAT_THROTTLE_MS) {
-                            return@onPreviewKeyEvent true
-                        }
-                        lastKeyRepeatTime[0] = now
-                    }
-                    false
-                },
+            modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(
                 start = 24.dp,
                 end = 24.dp,

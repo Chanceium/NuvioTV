@@ -41,7 +41,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
-import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
@@ -63,7 +62,6 @@ import java.time.format.DateTimeFormatter
 import javax.inject.Inject
 import java.util.Locale
 
-@OptIn(kotlinx.coroutines.FlowPreview::class)
 @HiltViewModel
 class HomeViewModel @Inject constructor(
     private val addonRepository: AddonRepository,
@@ -123,7 +121,6 @@ class HomeViewModel @Inject constructor(
     private var activeTrailerPreviewItemId: String? = null
     private var trailerPreviewRequestVersion: Long = 0L
     private var currentTmdbSettings: TmdbSettings = TmdbSettings()
-    private var heroEnrichmentJob: Job? = null
     private var lastHeroEnrichmentSignature: String? = null
     private var lastHeroEnrichedItems: List<MetaPreview> = emptyList()
     private val prefetchedExternalMetaIds = Collections.synchronizedSet(mutableSetOf<String>())
@@ -134,8 +131,6 @@ class HomeViewModel @Inject constructor(
     private val movieWatchedObserverJobs = mutableMapOf<String, Job>()
     @Volatile
     private var externalMetaPrefetchEnabled: Boolean = false
-    @Volatile
-    private var startupGracePeriodActive: Boolean = true
     val trailerPreviewUrls: Map<String, String>
         get() = trailerPreviewUrlsState
 
@@ -147,10 +142,6 @@ class HomeViewModel @Inject constructor(
         observeTmdbSettings()
         loadContinueWatching()
         observeInstalledAddons()
-        viewModelScope.launch {
-            delay(3000)
-            startupGracePeriodActive = false
-        }
     }
 
     private fun observeLayoutPreferences() {
@@ -230,7 +221,6 @@ class HomeViewModel @Inject constructor(
                 )
             }
                 .distinctUntilChanged()
-                .debounce(100)
                 .collectLatest { prefs ->
                 val effectivePosterLabelsEnabled = if (prefs.layout == HomeLayout.MODERN) {
                     false
@@ -334,7 +324,6 @@ class HomeViewModel @Inject constructor(
         releaseInfo: String?,
         apiType: String
     ) {
-        if (startupGracePeriodActive) return
         if (activeTrailerPreviewItemId != itemId) {
             activeTrailerPreviewItemId = itemId
             trailerPreviewRequestVersion++
@@ -374,7 +363,6 @@ class HomeViewModel @Inject constructor(
     }
 
     fun onItemFocus(item: MetaPreview) {
-        if (startupGracePeriodActive) return
         if (!externalMetaPrefetchEnabled) return
         if (item.id in prefetchedExternalMetaIds) return
         if (pendingExternalMetaPrefetchItemId == item.id) return
@@ -1335,17 +1323,29 @@ class HomeViewModel @Inject constructor(
     private fun scheduleUpdateCatalogRows() {
         catalogUpdateJob?.cancel()
         catalogUpdateJob = viewModelScope.launch {
-            val debounceMs = when {
-                // First render: use minimal debounce to show content ASAP while still
-                // batching near-simultaneous arrivals.
-                !hasRenderedFirstCatalog && catalogsMap.isNotEmpty() -> {
+            val currentLayout = _uiState.value.homeLayout
+            val preferSmootherBatching = currentLayout == HomeLayout.CLASSIC || currentLayout == HomeLayout.GRID
+            val loadedContentRowCount = catalogsMap.values.count { it.items.isNotEmpty() }
+
+           
+            if (!hasRenderedFirstCatalog && catalogsMap.isNotEmpty()) {
+                val shouldHoldFirstRenderForBatch =
+                    preferSmootherBatching &&
+                        pendingCatalogLoads > 0 &&
+                        loadedContentRowCount in 0..2
+
+                if (!shouldHoldFirstRenderForBatch) {
                     hasRenderedFirstCatalog = true
-                    50L
+                    updateCatalogRows()
+                    return@launch
                 }
-                pendingCatalogLoads > 8 -> 200L
-                pendingCatalogLoads > 3 -> 150L
-                pendingCatalogLoads > 0 -> 100L
-                else -> 50L
+            }
+            val debounceMs = when {
+                preferSmootherBatching && pendingCatalogLoads > 5 -> 650L
+                preferSmootherBatching && pendingCatalogLoads > 0 -> 380L
+                pendingCatalogLoads > 5 -> 450L
+                pendingCatalogLoads > 0 -> 250L
+                else -> 100L
             }
             delay(debounceMs)
             updateCatalogRows()
@@ -1471,9 +1471,28 @@ class HomeViewModel @Inject constructor(
             if (rows == fullRows) rows else fullRows
         }
 
-        // Emit un-enriched hero items immediately so the UI renders without waiting for TMDB
+        val tmdbSettings = currentTmdbSettings
+        val shouldUseEnrichedHeroItems = tmdbSettings.enabled &&
+            (tmdbSettings.useArtwork || tmdbSettings.useBasicInfo || tmdbSettings.useDetails)
+
+        val resolvedHeroItems = if (shouldUseEnrichedHeroItems) {
+            val enrichmentSignature = heroEnrichmentSignature(baseHeroItems, tmdbSettings)
+            if (lastHeroEnrichmentSignature == enrichmentSignature) {
+                lastHeroEnrichedItems
+            } else {
+                val enrichedItems = enrichHeroItems(baseHeroItems, tmdbSettings)
+                lastHeroEnrichmentSignature = enrichmentSignature
+                lastHeroEnrichedItems = enrichedItems
+                enrichedItems
+            }
+        } else {
+            lastHeroEnrichmentSignature = null
+            lastHeroEnrichedItems = emptyList()
+            baseHeroItems
+        }
+
         val nextGridItems = if (currentLayout == HomeLayout.GRID) {
-            replaceGridHeroItems(baseGridItems, baseHeroItems)
+            replaceGridHeroItems(baseGridItems, resolvedHeroItems)
         } else {
             baseGridItems
         }
@@ -1482,51 +1501,10 @@ class HomeViewModel @Inject constructor(
         _uiState.update { state ->
             state.copy(
                 catalogRows = if (state.catalogRows == displayRows) state.catalogRows else displayRows,
-                heroItems = if (state.heroItems == baseHeroItems) state.heroItems else baseHeroItems,
+                heroItems = if (state.heroItems == resolvedHeroItems) state.heroItems else resolvedHeroItems,
                 gridItems = if (state.gridItems == nextGridItems) state.gridItems else nextGridItems,
                 isLoading = false
             )
-        }
-
-        // Launch hero enrichment in the background — updates heroItems when done
-        val tmdbSettings = currentTmdbSettings
-        val shouldUseEnrichedHeroItems = tmdbSettings.enabled &&
-            (tmdbSettings.useArtwork || tmdbSettings.useBasicInfo || tmdbSettings.useDetails)
-
-        if (shouldUseEnrichedHeroItems && baseHeroItems.isNotEmpty()) {
-            heroEnrichmentJob?.cancel()
-            heroEnrichmentJob = viewModelScope.launch {
-                val enrichmentSignature = heroEnrichmentSignature(baseHeroItems, tmdbSettings)
-                if (lastHeroEnrichmentSignature == enrichmentSignature) {
-                    // Already enriched with same signature — apply cached result
-                    val cached = lastHeroEnrichedItems
-                    _uiState.update { state ->
-                        state.copy(
-                            heroItems = if (state.heroItems == cached) state.heroItems else cached,
-                            gridItems = if (currentLayout == HomeLayout.GRID) {
-                                val enrichedGrid = replaceGridHeroItems(state.gridItems, cached)
-                                if (state.gridItems == enrichedGrid) state.gridItems else enrichedGrid
-                            } else state.gridItems
-                        )
-                    }
-                } else {
-                    val enrichedItems = enrichHeroItems(baseHeroItems, tmdbSettings)
-                    lastHeroEnrichmentSignature = enrichmentSignature
-                    lastHeroEnrichedItems = enrichedItems
-                    _uiState.update { state ->
-                        state.copy(
-                            heroItems = if (state.heroItems == enrichedItems) state.heroItems else enrichedItems,
-                            gridItems = if (currentLayout == HomeLayout.GRID) {
-                                val enrichedGrid = replaceGridHeroItems(state.gridItems, enrichedItems)
-                                if (state.gridItems == enrichedGrid) state.gridItems else enrichedGrid
-                            } else state.gridItems
-                        )
-                    }
-                }
-            }
-        } else {
-            lastHeroEnrichmentSignature = null
-            lastHeroEnrichedItems = emptyList()
         }
 
         reconcilePosterStatusObservers(displayRows)

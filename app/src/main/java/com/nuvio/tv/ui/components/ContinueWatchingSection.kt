@@ -278,11 +278,10 @@ fun ContinueWatchingCard(
     val requestHeightPx = remember(imageHeight, density) {
         with(density) { imageHeight.roundToPx() }
     }
-    val imageRequest = remember(imageModel, requestWidthPx, requestHeightPx) {
+    val imageRequest = remember(context, imageModel, requestWidthPx, requestHeightPx) {
         ImageRequest.Builder(context)
             .data(imageModel)
             .crossfade(false)
-            .memoryCacheKey("${imageModel}_${requestWidthPx}x${requestHeightPx}")
             .size(width = requestWidthPx, height = requestHeightPx)
             .build()
     }

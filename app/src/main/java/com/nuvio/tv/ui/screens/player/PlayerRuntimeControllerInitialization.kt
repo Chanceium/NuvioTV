@@ -13,6 +13,9 @@ import androidx.media3.common.Tracks
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
+import androidx.media3.exoplayer.audio.AudioCapabilities
+import androidx.media3.exoplayer.audio.AudioSink
+import androidx.media3.exoplayer.audio.DefaultAudioSink
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.ForwardingRenderer
 import androidx.media3.exoplayer.Renderer
@@ -331,6 +334,58 @@ private class SubtitleOffsetRenderersFactory(
     context: Context,
     private val subtitleDelayUsProvider: () -> Long
 ) : DefaultRenderersFactory(context) {
+
+    override fun buildAudioSink(
+        context: Context,
+        enableFloatOutput: Boolean,
+        enableAudioTrackPlaybackParams: Boolean
+    ): AudioSink? {
+        val deviceCaps = AudioCapabilities.getCapabilities(context)
+
+        val hasAnyPassthrough = deviceCaps.supportsEncoding(C.ENCODING_AC3)
+                || deviceCaps.supportsEncoding(C.ENCODING_E_AC3)
+                || deviceCaps.supportsEncoding(C.ENCODING_DTS)
+
+        if (!hasAnyPassthrough) {
+            return super.buildAudioSink(context, enableFloatOutput, enableAudioTrackPlaybackParams)
+        }
+
+        // Device supports lossy passthrough via HDMI — force-add lossless encodings
+        // that Android often fails to report despite receiver/soundbar support
+        val knownEncodings = intArrayOf(
+            C.ENCODING_AC3,
+            C.ENCODING_E_AC3,
+            C.ENCODING_DTS,
+            C.ENCODING_DTS_HD,
+            C.ENCODING_DOLBY_TRUEHD,
+            C.ENCODING_E_AC3_JOC
+        )
+
+        val mergedEncodings = mutableSetOf<Int>()
+        for (encoding in knownEncodings) {
+            if (deviceCaps.supportsEncoding(encoding)) {
+                mergedEncodings.add(encoding)
+            }
+        }
+
+        // Force-add lossless formats
+        mergedEncodings.add(C.ENCODING_DOLBY_TRUEHD)
+        mergedEncodings.add(C.ENCODING_DTS_HD)
+        if (Build.VERSION.SDK_INT >= 28) {
+            mergedEncodings.add(C.ENCODING_E_AC3_JOC)
+        }
+
+        val enhancedCapabilities = AudioCapabilities(
+            mergedEncodings.toIntArray(),
+            /* maxChannelCount= */ 8
+        )
+
+        return DefaultAudioSink.Builder(context)
+            .setAudioCapabilities(enhancedCapabilities)
+            .setEnableFloatOutput(enableFloatOutput)
+            .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
+            .build()
+    }
 
     override fun buildTextRenderers(
         context: Context,
